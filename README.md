@@ -216,9 +216,16 @@ tflint --recursive                 # from the repo root
 
 ### 3. Security and policy scan
 
+Run once per environment, from the repo root, so the scanner sees that
+environment's variable values (Trivy does not load `terraform.tfvars` on its own):
+
 ```bash
-trivy config .                     # or: checkov -d .
+trivy config --tf-vars envs/<env>/terraform.tfvars envs/<env>
+# or: checkov -d envs/<env> --var-file envs/<env>/terraform.tfvars
 ```
+
+Without `--tf-vars`, Trivy warns that variable values were not found and
+can't evaluate settings driven by tfvars, such as flow logs.
 
 Expect some findings you accept on purpose (for example, flow logs off in
 non-prod). Suppress them inline with a comment explaining why, rather than
@@ -243,20 +250,130 @@ Look closely for `destroy` or `-/+` (replace) on networks or subnets.
 Replacing a subnet that has workloads attached will fail or cause an outage.
 `*.tfplan` files are git-ignored.
 
-### 6. Post-apply verification
+### 6. Post-apply verification with gcloud
+
+These checks ask GCP directly what exists, independent of Terraform's state,
+and compare it with what the environment's `terraform.tfvars` asked for.
+Run them from the environment folder after `apply`.
+
+Set up variables once:
 
 ```bash
-P=$(terraform output -json network | jq -r .project_id)
+cd envs/<env>
+ENV=<env>                                                  # e.g. lab
+P=$(terraform output -json network | jq -r .project_id)    # host project
+VPC=vpc-${ENV}-shared
+SA=sa-terraform@<seed-project>.iam.gserviceaccount.com     # optional, see note below
+```
 
-gcloud compute networks list --project="$P"
-gcloud compute networks subnets list --project="$P"
-gcloud compute firewall-rules list --project="$P"
-gcloud compute routers list --project="$P"
-gcloud compute routers nats list --router=cr-vpc-<env>-shared-<region> --region=<region> --project="$P"
+#### VPC
+
+```bash
+gcloud compute networks describe "$VPC" --project="$P" \
+  --format="table(name, routingConfig.routingMode, autoCreateSubnetworks)"
+```
+
+Expect: one VPC named `vpc-<env>-shared`, routing mode `GLOBAL` (or what you
+set), and `autoCreateSubnetworks` = `False` (custom mode). Also confirm there is
+no leftover `default` network:
+
+```bash
+gcloud compute networks list --project="$P"     # SUBNET_MODE should be CUSTOM
+```
+
+#### Subnets
+
+```bash
+gcloud compute networks subnets list --project="$P" --network="$VPC" \
+  --format="table(name, region.basename(), ipCidrRange, privateIpGoogleAccess, logConfig.enable:label=FLOW_LOGS, secondaryIpRanges[].rangeName.list():label=SECONDARY)"
+```
+
+Check each row against `subnets` in `terraform.tfvars`:
+
+| Column | Should match |
+|---|---|
+| `NAME` | `sn-<env>-<key>` for every key in `subnets`, and nothing extra |
+| `REGION` | that subnet's `region` |
+| `RANGE` | that subnet's `ip_cidr_range` |
+| `PRIVATE_IP_GOOGLE_ACCESS` | `True` unless you set `private_google_access = false` |
+| `FLOW_LOGS` | `True` where `flow_logs = true`, empty otherwise |
+| `SECONDARY` | the keys of `secondary_ranges`, if any |
+
+Inspect one subnet in full, including secondary CIDRs and flow-log settings:
+
+```bash
+gcloud compute networks subnets describe sn-${ENV}-use1 --region=us-east1 --project="$P" \
+  --format="yaml(name, ipCidrRange, gatewayAddress, privateIpGoogleAccess, secondaryIpRanges, logConfig)"
+```
+
+Compare the subnets with what Terraform says it manages:
+
+```bash
+terraform output -json subnets | jq -r 'to_entries[] | "\(.key)\t\(.value.region)\t\(.value.cidr)"'
+```
+
+#### Firewall rules
+
+```bash
+gcloud compute firewall-rules list --project="$P" --filter="network~/${VPC}$" \
+  --format="table(name, direction, priority, sourceRanges.list(), allowed[].map().firewall_rule().list())"
+```
+
+Expect exactly two rules: `vpc-<env>-shared-allow-internal`, whose source
+ranges are your subnets' primary and secondary CIDRs, and
+`vpc-<env>-shared-allow-iap-ssh`, from `35.235.240.0/20` on `tcp:22`
+(unless `iap_ssh_enabled = false`).
+
+#### Cloud Router and NAT
+
+```bash
+gcloud compute routers list --project="$P" --filter="network~/${VPC}$" \
+  --format="table(name, region.basename(), network.basename())"
+
+for R in $(gcloud compute routers list --project="$P" --filter="network~/${VPC}$" --format="value(name,region.basename())" | tr '\t' ','); do
+  NAME=${R%,*}; REGION=${R#*,}
+  gcloud compute routers nats list --router="$NAME" --region="$REGION" --project="$P" \
+    --format="table(name, natIpAllocateOption, sourceSubnetworkIpRangesToNat, logConfig.filter)"
+done
+```
+
+Expect one router (`cr-vpc-<env>-shared-<region>`) and one NAT for every region
+that has a subnet, unless `enable_nat = false`.
+
+#### Shared VPC host
+
+```bash
+gcloud compute projects describe "$P" --format="value(xpnProjectStatus)"
+```
+
+Expect `HOST`. To list every host project in the org:
+
+```bash
 gcloud compute shared-vpc organizations list-host-projects <org-id>
 ```
 
-Then confirm there is no drift:
+#### Running as the Terraform service account
+
+The commands above run as your own `gcloud` login. Your personal account may
+not have read access to the host projects once those roles have been removed.
+In that case, run them as the SA by adding a flag:
+
+```bash
+gcloud compute networks subnets list --project="$P" --network="$VPC" \
+  --impersonate-service-account="$SA"
+```
+
+Or set it once for the shell session:
+
+```bash
+gcloud config set auth/impersonate_service_account "$SA"
+# ... run checks ...
+gcloud config unset auth/impersonate_service_account
+```
+
+#### Drift check
+
+Then confirm Terraform and GCP agree:
 
 ```bash
 terraform plan                     # should report: No changes.
