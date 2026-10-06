@@ -1,33 +1,34 @@
 # Network stage: per-environment Shared VPCs
 
 This stage creates one custom-mode VPC in each environment's net-host project.
-Each project was created by the **projects stage**, one host project per
-environment folder. The VPC configuration lives in a shared module; each
-environment has its own small root configuration, its own variables, and its
-own state file.
+Each host project was created by the **projects stage**, one per environment
+folder. The VPC configuration lives in a shared module; each environment has
+its own small root configuration, its own variables, and its own state file.
+
+All Terraform operations run as a dedicated **Terraform service account**,
+which you impersonate with your own Google credentials. No service account
+keys are created or stored.
 
 ## Layout
 
 ```
-net-vpcs/
+terraform-vpc-setup-gcp/
 ├── .gitignore
+├── .tflint.hcl               # TFLint config (Google ruleset)
 ├── README.md
 ├── modules/
 │   └── vpc/                  # common config, used by every environment
 │       ├── main.tf           # VPC, subnets, firewall, Cloud Router/NAT, Shared VPC host
-│       ├── variables.tf
+│       ├── variables.tf      # inputs, with validation rules
 │       ├── outputs.tf
 │       └── versions.tf
 └── envs/
-    ├── dev/                  # one root config per environment
-    │   ├── backend.tf        # GCS backend, prefix network/dev
-    │   ├── main.tf           # reads host project ID, calls modules/vpc
-    │   ├── variables.tf
-    │   ├── outputs.tf
-    │   └── terraform.tfvars  # this environment's values
-    ├── test/
-    ├── stage/
-    └── prod/
+    └── <env>/                # one root config per environment (lab, dev, prod, ...)
+        ├── backend.tf        # GCS backend (prefix network/<env>) + provider, both impersonating the SA
+        ├── main.tf           # reads host project ID from remote state, calls modules/vpc
+        ├── variables.tf
+        ├── outputs.tf
+        └── terraform.tfvars  # this environment's values
 ```
 
 Terraform is **only run from an `envs/<env>` folder**. `modules/vpc` is never
@@ -46,24 +47,106 @@ run directly; it has no backend, provider, or tfvars and is loaded through the
 | Cloud Router + NAT | `cr-` / `nat-vpc-<env>-shared-<region>` | One per region that has a subnet; toggle with `enable_nat` |
 | Shared VPC host | – | Registers the project as a host; toggle with `enable_shared_vpc` |
 
-## How it finds the host projects
+## Authentication: Terraform service account
 
-Host project IDs include a random suffix, so they are not typed by hand. Each
-environment reads them from the projects stage's state:
+Terraform authenticates as you (Application Default Credentials) and then
+impersonates the Terraform service account in the seed project. Every API
+call, including state reads and writes, is made as that service account.
+
+```
+you (ADC)  ──serviceAccountTokenCreator──▶  sa-terraform@<seed-project>  ──roles──▶  GCP resources + state bucket
+```
+
+### One-time setup
+
+```bash
+SEED=<seed-project-id>                        # e.g. shv-cld-admn-btstrp-4329
+SA=sa-terraform@${SEED}.iam.gserviceaccount.com
+ME=user:<your-email>
+ORG=<org-id>
+FOLDER=<folder containing the environment folders>
+BUCKET=<state-bucket>
+
+# 1. Create the SA and enable the API used for impersonation
+gcloud iam service-accounts create sa-terraform --project="$SEED" --display-name="Terraform"
+gcloud services enable iamcredentials.googleapis.com --project="$SEED"
+
+# 2. Allow yourself to impersonate it
+gcloud iam service-accounts add-iam-policy-binding "$SA" --project="$SEED" \
+  --member="$ME" --role="roles/iam.serviceAccountTokenCreator"
+
+# 3. Grant the SA what the network stage needs
+for ROLE in roles/serviceusage.serviceUsageAdmin roles/compute.networkAdmin; do
+  gcloud resource-manager folders add-iam-policy-binding "$FOLDER" \
+    --member="serviceAccount:$SA" --role="$ROLE"
+done
+gcloud organizations add-iam-policy-binding "$ORG" \
+  --member="serviceAccount:$SA" --role="roles/compute.xpnAdmin"
+gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" \
+  --member="serviceAccount:$SA" --role="roles/storage.objectAdmin"
+```
+
+| Principal | Role | Scope | Why |
+|---|---|---|---|
+| You | `roles/iam.serviceAccountTokenCreator` | Terraform SA | Impersonate the SA |
+| Terraform SA | `roles/compute.networkAdmin` | Environment folder(s) | VPCs, subnets, firewall, routers, NAT |
+| Terraform SA | `roles/serviceusage.serviceUsageAdmin` | Environment folder(s) | Enable the Compute API |
+| Terraform SA | `roles/compute.xpnAdmin` | Organization (or folder) | Shared VPC host enablement |
+| Terraform SA | `roles/storage.objectAdmin` | State bucket | Read projects-stage state; read/write network state |
+
+Your personal account needs no other roles for this stage. Remove any you
+granted yourself while testing.
+
+If the projects stage already enables `compute.googleapis.com`, you can delete
+`google_project_service.compute` from the module and drop the
+`serviceUsageAdmin` grant.
+
+### Where impersonation is configured
+
+The SA is set in three places in each environment, because each one makes its
+own connection to GCP:
 
 ```hcl
+# backend.tf: state reads/writes
+backend "gcs" {
+  bucket                      = "<state-bucket>"
+  prefix                      = "network/<env>"
+  impersonate_service_account = "sa-terraform@<seed-project>.iam.gserviceaccount.com"
+}
+
+# backend.tf: resource creation
+provider "google" {
+  impersonate_service_account = "sa-terraform@<seed-project>.iam.gserviceaccount.com"
+}
+
+# main.tf: reading the projects stage's state
 data "terraform_remote_state" "projects" {
   backend = "gcs"
   config = {
-    bucket = var.state_bucket
-    prefix = var.projects_state_prefix
+    bucket                      = var.state_bucket
+    prefix                      = var.projects_state_prefix
+    impersonate_service_account = "sa-terraform@<seed-project>.iam.gserviceaccount.com"
   }
 }
-
-# project_id = data.terraform_remote_state.projects.outputs.host_project_ids[var.env]
 ```
 
-This relies on the projects stage's existing output:
+Backend blocks can't use variables, so the email is written out literally.
+Changing backend settings after an `init` requires `terraform init -reconfigure`
+(the state stays where it is; don't use `-migrate-state`).
+
+### Signing in
+
+```bash
+gcloud auth application-default login     # plain user login; no --impersonate flag
+```
+
+Your org's session-control policy may force periodic reauthentication. If
+Terraform fails with `invalid_grant` / `invalid_rapt`, run the command again.
+
+## How it finds the host projects
+
+Host project IDs include a random suffix, so they are not typed by hand. Each
+environment reads them from the projects stage's existing output:
 
 ```hcl
 output "host_project_ids" {
@@ -71,7 +154,8 @@ output "host_project_ids" {
 }
 ```
 
-`var.env` must be one of that output's keys (the environment folder names).
+and passes `host_project_ids[var.env]` to the module. `var.env` must be one of
+that output's keys (the environment folder names).
 
 ## State layout
 
@@ -81,87 +165,159 @@ All state lives in the GCS bucket created by the bootstrap (seed) project:
 gs://<state-bucket>/
 ├── <projects-stage-prefix>/default.tfstate   # read by every env (remote state)
 └── network/
-    ├── dev/default.tfstate
-    ├── test/default.tfstate
-    ├── stage/default.tfstate
-    └── prod/default.tfstate
+    └── <env>/default.tfstate                 # one per environment
 ```
 
 ## Prerequisites
 
-- Terraform >= 1.5 and the `hashicorp/google` provider (>= 6.0, < 8.0).
-- The projects stage applied, with `host_project_ids` in its state.
-- The identity running Terraform needs:
-  - `roles/compute.networkAdmin` on each host project
-  - `roles/compute.xpnAdmin` at the org or folder level (for Shared VPC host enablement)
-  - `roles/serviceusage.serviceUsageAdmin` on each host project (to enable the Compute API)
-  - read access to the projects stage's state object, and read/write on `network/<env>/`
+- Terraform >= 1.5 and the `hashicorp/google` provider (>= 6.0, < 8.0)
+- `gcloud` CLI, signed in with ADC
+- The projects stage applied, with `host_project_ids` in its state
+- The Terraform SA set up as described above
+- Validation tools (optional but recommended): [TFLint](https://github.com/terraform-linters/tflint),
+  [Trivy](https://trivy.dev) or [Checkov](https://www.checkov.io), `jq`
 
-## First-time setup
+## First-time setup for an environment
 
-For each environment folder:
-
-1. **`backend.tf`**: set `bucket` to your state bucket. The `prefix`
-   (`network/<env>`) is already set; backend blocks can't use variables.
-2. **`terraform.tfvars`**:
+1. **`backend.tf`**: set `bucket`, keep `prefix = "network/<env>"`, and set
+   `impersonate_service_account` in both the backend and provider blocks.
+2. **`main.tf`**: set `impersonate_service_account` in the
+   `terraform_remote_state` config.
+3. **`terraform.tfvars`**:
    - `env`: the environment folder name, exactly as it appears as a key in `host_project_ids`
-   - `state_bucket`: same bucket as above
+   - `state_bucket`: the state bucket
    - `projects_state_prefix`: the `prefix` from the projects stage's `backend "gcs"` block
    - `subnets`: this environment's subnets and CIDRs
-3. Rename the `envs/<env>` folder if your environment names differ from
-   `dev`/`test`/`stage`/`prod`, and update the backend prefix to match.
+
+## Validation
+
+Run these in order. Steps 1 to 3 need no GCP access and are cheap enough to
+run on every change.
+
+### 1. Formatting and syntax
+
+```bash
+terraform fmt -check -recursive    # from the repo root; use without -check to fix
+cd envs/<env>
+terraform init
+terraform validate                 # syntax, types, references
+```
+
+### 2. Lint
+
+`validate` only checks that the config is well formed. TFLint with the Google
+ruleset also catches provider-level mistakes such as invalid regions or
+attribute values, plus unused declarations.
+
+```bash
+tflint --init                      # once, downloads the Google ruleset from .tflint.hcl
+tflint --recursive                 # from the repo root
+```
+
+### 3. Security and policy scan
+
+```bash
+trivy config .                     # or: checkov -d .
+```
+
+Expect some findings you accept on purpose (for example, flow logs off in
+non-prod). Suppress them inline with a comment explaining why, rather than
+ignoring the tool.
+
+### 4. Input validation (built in)
+
+The module rejects bad input at `plan` time:
+
+- every subnet `ip_cidr_range` and secondary range must be a valid CIDR
+- `routing_mode` must be `GLOBAL` or `REGIONAL`
+
+### 5. Plan review
+
+```bash
+terraform plan -out=tfplan
+terraform show tfplan              # review before applying
+terraform apply tfplan             # applies exactly what was reviewed
+```
+
+Look closely for `destroy` or `-/+` (replace) on networks or subnets.
+Replacing a subnet that has workloads attached will fail or cause an outage.
+`*.tfplan` files are git-ignored.
+
+### 6. Post-apply verification
+
+```bash
+P=$(terraform output -json network | jq -r .project_id)
+
+gcloud compute networks list --project="$P"
+gcloud compute networks subnets list --project="$P"
+gcloud compute firewall-rules list --project="$P"
+gcloud compute routers list --project="$P"
+gcloud compute routers nats list --router=cr-vpc-<env>-shared-<region> --region=<region> --project="$P"
+gcloud compute shared-vpc organizations list-host-projects <org-id>
+```
+
+Then confirm there is no drift:
+
+```bash
+terraform plan                     # should report: No changes.
+```
+
+### Optional: pre-commit
+
+[pre-commit-terraform](https://github.com/antonbabenko/pre-commit-terraform)
+can run `terraform fmt`, `terraform validate`, `tflint`, and `trivy`
+automatically on every commit.
 
 ## Usage
 
 ```bash
-cd envs/dev
+cd envs/<env>
 terraform init
 terraform validate
-terraform plan
-terraform apply
+terraform plan -out=tfplan
+terraform apply tfplan
 ```
 
-Repeat in `envs/test`, `envs/stage`, then `envs/prod`.
-
 Re-run `terraform init` only after changing the backend or a module `source`
-path. Edits inside `modules/vpc` are picked up by `plan` directly.
+path (`-reconfigure` if the backend settings changed). Edits inside
+`modules/vpc` are picked up by `plan` directly.
 
 ## Making changes
 
 - **One environment only** (CIDRs, flow logs, NAT): edit that environment's
   `terraform.tfvars` and plan/apply in its folder.
 - **All environments** (new firewall rule, naming, defaults): edit
-  `modules/vpc`, then plan in each environment, dev first and prod last.
+  `modules/vpc`, then plan in each environment, lowest first and prod last.
 - **New environment**: copy an existing `envs/<env>` folder, change the backend
   prefix and `terraform.tfvars`, and make sure the projects stage has a host
-  project for it.
+  project for it and the SA's folder-level roles cover it.
 
 ## CIDR plan
 
 Ranges must not overlap across environments, so the VPCs can later be peered
-or connected through a hub without renumbering. The example values use one
-/16 per environment, split into /20 subnets per region:
+or connected through a hub without renumbering. Use one /16 per environment,
+split into /20 subnets per region, for example:
 
 | Environment | Range | us-east1 | us-central1 | GKE secondary |
 |---|---|---|---|---|
-| dev | 10.10.0.0/16 | 10.10.0.0/20 | 10.10.16.0/20 | – |
-| test | 10.20.0.0/16 | 10.20.0.0/20 | 10.20.16.0/20 | – |
-| stage | 10.30.0.0/16 | 10.30.0.0/20 | 10.30.16.0/20 | – |
+| env 1 | 10.10.0.0/16 | 10.10.0.0/20 | 10.10.16.0/20 | – |
+| env 2 | 10.20.0.0/16 | 10.20.0.0/20 | 10.20.16.0/20 | – |
+| env 3 | 10.30.0.0/16 | 10.30.0.0/20 | 10.30.16.0/20 | – |
 | prod | 10.40.0.0/16 | 10.40.0.0/20 | 10.40.16.0/20 | pods 10.140.0.0/16, services 10.141.0.0/20 |
 
 ## Outputs
 
 Each environment exposes:
 
-- `network`: VPC `id`, `name`, and `self_link`
+- `network`: VPC `project_id`, `id`, `name`, and `self_link`
 - `subnets`: map of subnet key to `self_link`, `region`, and `cidr`
 
 Later stages (service projects, GKE, and so on) can read these through
-`terraform_remote_state` with prefix `network/<env>`.
+`terraform_remote_state` with prefix `network/<env>`, using the same SA.
 
 ## Version control
 
 - Commit `.terraform.lock.hcl` in each env folder after the first `init`.
 - `terraform.tfvars` files are committed; they hold configuration, not secrets.
   Put anything sensitive in an ignored `*.local.tfvars` or `*.secret.tfvars`.
-- State, plan files, and `.terraform/` are ignored.
+- State, plan files, `.terraform/`, and `*.json` (to catch stray keys) are ignored.
