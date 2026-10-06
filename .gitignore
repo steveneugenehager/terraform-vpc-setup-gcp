@@ -15,10 +15,10 @@ tfplan
 crash.log
 crash.*.log
 
-# Variable files: real values stay local; commit only *.example
-*.tfvars
-*.tfvars.json
-!*.tfvars.example
+# Per-environment terraform.tfvars are committed (config only, no secrets).
+# Keep anything sensitive in a local, ignored file instead.
+*.secret.tfvars
+*.local.tfvars
 
 # Local override files
 override.tf
