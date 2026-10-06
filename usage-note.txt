@@ -1,0 +1,16 @@
+#2026-10-05 
+
+You run Terraform from an environment folder:
+
+cd envs/lab
+terraform init      # sets up the GCS backend (network/lab) and pulls in ../../modules/vpc
+terraform plan      # reads envs/dev/terraform.tfvars automatically
+terraform apply
+
+Then repeat in each of the other environments (envs/test, envs/stage and envs/prod).
+
+During init, Terraform follows the source = "../../modules/vpc" line in the env's main.tf and loads the module's files. Its main.tf, variables.tf and so on then become part of that environment's configuration. So modules/vpc/main.tf does get used, but only through an env folder.
+
+Each env folder is a separate root module. That's what gives you a separate state file and separate plans per environment.
+
+If you edit anything in modules/vpc/, run plan in each env folder to see how the change affects that environment. Usually you'd start with dev and finish with prod. init doesn't need re-running after module edits, because local-path modules are read directly. You only need it again when you change the source path or add a new module.

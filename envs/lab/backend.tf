@@ -11,8 +11,8 @@ terraform {
   # One state file per environment. Backend blocks can't use variables,
   # so the prefix is fixed here.
   backend "gcs" {
-    bucket = "REPLACE-with-your-tfstate-bucket"
-    prefix = "network/test"
+    bucket = "shv-cld-admn-btstrp-4329-tfstate"
+    prefix = "network/lab"
   }
 }
 
