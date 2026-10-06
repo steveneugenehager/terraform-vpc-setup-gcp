@@ -1,0 +1,48 @@
+# Copy to terraform.tfvars and replace project IDs / CIDRs with your own.
+# Plan CIDRs so nothing overlaps across environments or host projects,
+# so you can peer or interconnect later without renumbering.
+
+net_host_projects = {
+  # Example: one host project per environment tier
+  nonprod = {
+    project_id = "prj-net-host-nonprod"
+    environments = {
+      dev = {
+        subnets = {
+          use1 = { region = "us-east1",    ip_cidr_range = "10.10.0.0/20" }
+          usc1 = { region = "us-central1", ip_cidr_range = "10.10.16.0/20" }
+        }
+      }
+      stage = {
+        subnets = {
+          use1 = { region = "us-east1",    ip_cidr_range = "10.20.0.0/20" }
+          usc1 = { region = "us-central1", ip_cidr_range = "10.20.16.0/20" }
+        }
+      }
+    }
+  }
+
+  prod = {
+    project_id = "prj-net-host-prod"
+    environments = {
+      prod = {
+        subnets = {
+          use1 = {
+            region        = "us-east1"
+            ip_cidr_range = "10.30.0.0/20"
+            flow_logs     = true
+            secondary_ranges = {
+              gke-pods     = "10.130.0.0/16"
+              gke-services = "10.131.0.0/20"
+            }
+          }
+          usc1 = {
+            region        = "us-central1"
+            ip_cidr_range = "10.30.16.0/20"
+            flow_logs     = true
+          }
+        }
+      }
+    }
+  }
+}
