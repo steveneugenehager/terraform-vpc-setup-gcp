@@ -13,7 +13,10 @@ terraform {
   backend "gcs" {
     bucket = "shv-cld-admn-btstrp-4329-tfstate"
     prefix = "network/lab"
+    impersonate_service_account = "terraform@shv-cld-admn-btstrp-4329.iam.gserviceaccount.com"
   }
 }
 
-provider "google" {}
+provider "google" {
+    impersonate_service_account = "terraform@shv-cld-admn-btstrp-4329.iam.gserviceaccount.com"
+}

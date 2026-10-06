@@ -13,6 +13,11 @@ variable "projects_state_prefix" {
   type        = string
 }
 
+variable "terraform_sa" {
+  description = "Service Account used to execute terraform operations."
+  type        = string
+}
+
 variable "subnets" {
   description = "Subnets for this environment's VPC, keyed by short name."
   type = map(object({

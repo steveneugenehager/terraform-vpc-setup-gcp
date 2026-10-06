@@ -3,6 +3,7 @@ data "terraform_remote_state" "projects" {
   config = {
     bucket = var.state_bucket
     prefix = var.projects_state_prefix
+    impersonate_service_account = var.terraform_sa
   }
 }
 
