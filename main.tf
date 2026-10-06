@@ -1,38 +1,29 @@
 locals {
-  # One entry per (host project, environment) => one VPC
-  vpcs = merge([
-    for host_key, host in var.net_host_projects : {
-      for env, cfg in host.environments :
-      "${host_key}-${env}" => {
-        host_key     = host_key
-        project_id   = host.project_id
-        env          = env
-        name         = lower("${var.name_prefix}-${env}-${host_key}")
-        routing_mode = cfg.routing_mode
-        enable_nat   = cfg.enable_nat
-        subnets      = cfg.subnets
-      }
-    }
-  ]...)
+  # One VPC per environment, placed in that environment's host project
+  vpcs = {
+    for key, cfg in var.networks : key => merge(cfg, {
+      project_id = local.host_projects[key].project_id
+      env        = local.host_projects[key].env
+      name       = "vpc-${local.host_projects[key].env}-shared"
+    })
+  }
 
-  # One entry per subnet across all VPCs
   subnets = merge([
-    for vpc_key, vpc in local.vpcs : {
+    for key, vpc in local.vpcs : {
       for sn_key, sn in vpc.subnets :
-      "${vpc_key}-${sn_key}" => merge(sn, {
-        vpc_key    = vpc_key
+      "${key}-${sn_key}" => merge(sn, {
+        vpc_key    = key
         project_id = vpc.project_id
-        name       = lower("sn-${vpc.env}-${vpc.host_key}-${sn_key}")
+        name       = lower("sn-${vpc.env}-${sn_key}")
       })
     }
   ]...)
 
-  # One Cloud Router/NAT per (VPC, region) where NAT is enabled
   nat_regions = merge([
-    for vpc_key, vpc in local.vpcs : {
+    for key, vpc in local.vpcs : {
       for region in distinct([for s in values(vpc.subnets) : s.region]) :
-      "${vpc_key}-${region}" => {
-        vpc_key    = vpc_key
+      "${key}-${region}" => {
+        vpc_key    = key
         project_id = vpc.project_id
         region     = region
         name       = "${vpc.name}-${region}"
@@ -40,18 +31,24 @@ locals {
     } if vpc.enable_nat
   ]...)
 
-  # All primary + secondary CIDRs per VPC, for the allow-internal rule
   vpc_cidrs = {
-    for vpc_key, vpc in local.vpcs : vpc_key => flatten([
+    for key, vpc in local.vpcs : key => flatten([
       for s in values(vpc.subnets) : concat([s.ip_cidr_range], values(s.secondary_ranges))
     ])
+  }
+}
+
+check "every_network_has_a_host_project" {
+  assert {
+    condition     = length(setsubtract(keys(var.networks), keys(local.host_projects))) == 0
+    error_message = "var.networks has keys with no matching net-host project: ${join(", ", setsubtract(keys(var.networks), keys(local.host_projects)))}"
   }
 }
 
 # --- APIs -------------------------------------------------------------------
 
 resource "google_project_service" "compute" {
-  for_each = var.net_host_projects
+  for_each = local.vpcs
 
   project            = each.value.project_id
   service            = "compute.googleapis.com"
@@ -67,7 +64,7 @@ resource "google_compute_network" "vpc" {
   name                    = each.value.name
   auto_create_subnetworks = false
   routing_mode            = each.value.routing_mode
-  description             = "${each.value.env} VPC in ${each.value.host_key}"
+  description             = "Shared VPC for the ${each.value.env} environment"
 
   depends_on = [google_project_service.compute]
 }
@@ -105,12 +102,11 @@ resource "google_compute_subnetwork" "subnet" {
 resource "google_compute_firewall" "allow_internal" {
   for_each = local.vpcs
 
-  project   = each.value.project_id
-  name      = "${each.value.name}-allow-internal"
-  network   = google_compute_network.vpc[each.key].id
-  direction = "INGRESS"
-  priority  = 1000
-
+  project       = each.value.project_id
+  name          = "${each.value.name}-allow-internal"
+  network       = google_compute_network.vpc[each.key].id
+  direction     = "INGRESS"
+  priority      = 1000
   source_ranges = local.vpc_cidrs[each.key]
 
   allow { protocol = "tcp" }
@@ -121,12 +117,11 @@ resource "google_compute_firewall" "allow_internal" {
 resource "google_compute_firewall" "allow_iap_ssh" {
   for_each = var.iap_ssh_enabled ? local.vpcs : {}
 
-  project   = each.value.project_id
-  name      = "${each.value.name}-allow-iap-ssh"
-  network   = google_compute_network.vpc[each.key].id
-  direction = "INGRESS"
-  priority  = 1000
-
+  project       = each.value.project_id
+  name          = "${each.value.name}-allow-iap-ssh"
+  network       = google_compute_network.vpc[each.key].id
+  direction     = "INGRESS"
+  priority      = 1000
   source_ranges = ["35.235.240.0/20"] # Google IAP TCP forwarding range
 
   allow {
@@ -162,12 +157,11 @@ resource "google_compute_router_nat" "nat" {
   }
 }
 
-# --- Shared VPC host enablement (once per project, not per VPC) -------------
+# --- Shared VPC host enablement ---------------------------------------------
 
 resource "google_compute_shared_vpc_host_project" "host" {
-  for_each = { for k, v in var.net_host_projects : k => v if v.enable_shared_vpc }
+  for_each = { for k, v in local.vpcs : k => v if v.enable_shared_vpc }
 
-  project = each.value.project_id
-
+  project    = each.value.project_id
   depends_on = [google_compute_network.vpc]
 }

@@ -11,7 +11,7 @@ terraform {
   # State lives in the bucket created by your bootstrap/seed project.
   backend "gcs" {
     bucket = "REPLACE-with-your-tfstate-bucket"
-    prefix = "networking/vpcs"
+    prefix = "network" # REPLACE with your network stage prefix
   }
 }
 

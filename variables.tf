@@ -1,52 +1,47 @@
-variable "net_host_projects" {
+variable "state_bucket" {
+  description = "GCS bucket holding Terraform state (from the bootstrap/seed project)."
+  type        = string
+}
+
+variable "projects_state_prefix" {
+  description = "State prefix of the stage that created the net-host projects."
+  type        = string
+}
+
+variable "networks" {
   description = <<-EOT
-    Net-host projects keyed by a short name. Each project gets one VPC per
-    environment listed under it, each with its own subnets.
+    VPC config per environment. Keys must match the keys of var.environments in
+    the projects stage; each one becomes the single VPC in that env's host project.
   EOT
   type = map(object({
-    project_id         = string
-    enable_shared_vpc  = optional(bool, true)
-    environments = map(object({
-      routing_mode = optional(string, "GLOBAL")
-      enable_nat   = optional(bool, true)
-      subnets = map(object({
-        region                = string
-        ip_cidr_range         = string
-        private_google_access = optional(bool, true)
-        flow_logs             = optional(bool, false)
-        secondary_ranges      = optional(map(string), {}) # name => CIDR (e.g. GKE pods/services)
-      }))
+    routing_mode      = optional(string, "GLOBAL")
+    enable_nat        = optional(bool, true)
+    enable_shared_vpc = optional(bool, true)
+    subnets = map(object({
+      region                = string
+      ip_cidr_range         = string
+      private_google_access = optional(bool, true)
+      flow_logs             = optional(bool, false)
+      secondary_ranges      = optional(map(string), {}) # name => CIDR (e.g. GKE pods/services)
     }))
   }))
 
   validation {
     condition = alltrue(flatten([
-      for p in values(var.net_host_projects) : [
-        for e in values(p.environments) : [
-          for s in values(e.subnets) : concat(
-            [can(cidrhost(s.ip_cidr_range, 0))],
-            [for r in values(s.secondary_ranges) : can(cidrhost(r, 0))]
-          )
-        ]
+      for n in values(var.networks) : [
+        for s in values(n.subnets) : concat(
+          [can(cidrhost(s.ip_cidr_range, 0))],
+          [for r in values(s.secondary_ranges) : can(cidrhost(r, 0))]
+        )
       ]
     ]))
     error_message = "Every ip_cidr_range and secondary range must be a valid CIDR block."
   }
 
   validation {
-    condition = alltrue(flatten([
-      for p in values(var.net_host_projects) : [
-        for e in values(p.environments) : contains(["GLOBAL", "REGIONAL"], e.routing_mode)
-      ]
-    ]))
+    condition     = alltrue([for n in values(var.networks) : contains(["GLOBAL", "REGIONAL"], n.routing_mode)])
     error_message = "routing_mode must be GLOBAL or REGIONAL."
   }
-}
-
-variable "name_prefix" {
-  description = "Prefix for resource names, e.g. vpc-<env>-<host>."
-  type        = string
-  default     = "vpc"
 }
 
 variable "iap_ssh_enabled" {

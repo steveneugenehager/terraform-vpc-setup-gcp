@@ -1,10 +1,16 @@
 output "networks" {
-  description = "VPC self links keyed by <host>-<env>."
-  value       = { for k, v in google_compute_network.vpc : k => v.self_link }
+  description = "VPC per environment."
+  value = {
+    for k, v in google_compute_network.vpc : k => {
+      project_id = v.project
+      name       = v.name
+      self_link  = v.self_link
+    }
+  }
 }
 
 output "subnets" {
-  description = "Subnet details keyed by <host>-<env>-<subnet>."
+  description = "Subnets keyed by <env>-<subnet>."
   value = {
     for k, v in google_compute_subnetwork.subnet : k => {
       self_link = v.self_link
