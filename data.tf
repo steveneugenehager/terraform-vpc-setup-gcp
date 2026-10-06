@@ -8,5 +8,9 @@ data "terraform_remote_state" "projects" {
 }
 
 locals {
-  host_projects = data.terraform_remote_state.projects.outputs.host_projects
+  # Keyed by environment folder name; that name is also used in resource names.
+  host_projects = {
+    for env, id in data.terraform_remote_state.projects.outputs.host_project_ids :
+    env => { project_id = id, env = env }
+  }
 }

@@ -1,7 +1,7 @@
 state_bucket          = "REPLACE-with-your-tfstate-bucket"
 projects_state_prefix = "REPLACE-with-projects-stage-prefix"
 
-# Keys must match var.environments keys in the projects stage.
+# Keys must match the keys of host_project_ids from the projects stage.
 # One /16 per environment, carved into /20 subnets per region; no overlap anywhere.
 networks = {
   dev = {

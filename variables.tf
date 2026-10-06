@@ -10,8 +10,9 @@ variable "projects_state_prefix" {
 
 variable "networks" {
   description = <<-EOT
-    VPC config per environment. Keys must match the keys of var.environments in
-    the projects stage; each one becomes the single VPC in that env's host project.
+    VPC config per environment. Keys must match the keys of the projects stage's
+    host_project_ids output (environment folder names); each becomes the single
+    VPC in that environment's host project.
   EOT
   type = map(object({
     routing_mode      = optional(string, "GLOBAL")
